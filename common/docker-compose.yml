@@ -1,0 +1,11 @@
+version: "2"
+services:
+  openresty:
+    image: openresty
+    build: .
+    volumes:
+      - ./nginx/lualib:/usr/local/openresty/nginx/lualib-common:ro
+      - ./nginx/static:/usr/local/openresty/nginx/static:ro
+  redis:
+    image: redis:latest
+    command: redis-server --appendonly yes

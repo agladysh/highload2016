@@ -1,0 +1,20 @@
+version: "2"
+services:
+
+  highload2016-openresty:
+    extends:
+      file: highload2016/docker-compose.yml
+      service: openresty
+    links:
+      - highload2016-redis:redis
+  highload2016-redis:
+    extends:
+      file: highload2016/docker-compose.yml
+      service: redis
+
+  router:
+    extends:
+      file: router/docker-compose.yml
+      service: router
+    links:
+      - highload2016-openresty

@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta http-equiv="Content-type" content="text/html; charset=utf-8">
+  <link rel="stylesheet" href="tacit.min.css"/>
+  <link rel="stylesheet" href="style.css">
+  <title>Geo Client</title>
+</head>
+<body>
+  <div id="toolbar">
+    <label>
+      User ID: <input id="user-id" placeholder="User ID" value="user.1">
+    </label>
+    <button id="refresh">Submit</button>
+    <br>
+    Location: <span id="location">Waiting for geolocation...</span>
+    <br>
+    <label><input type="checkbox" id="smooth" checked> Smooth GPS</label>
+    <label><input type="checkbox" id="simulation"> GPS by Click</label>
+  </div>
+  <div id="map">Loading map...</div>
+  <div id="output">Loading objects...</div>
+
+  <script type="text/javascript" src="HTML.min.js"></script>
+
+  <script type="text/javascript" src="chance.min.js"></script>
+
+  <script type="text/javascript"> module = {}; </script>
+  <script type="text/javascript" src="moving-average.js"></script>
+
+  <script type="text/javascript">
+function main() {
+  'use strict';
+
+  // TODO: Hack. Incapsulate url data loading and storing.
+  var LAST_USER = (window.location.hash ? window.location.hash.slice(5) : null) || 'user.1';
+  if (LAST_USER !== window.location.hash.slice(5)) {
+    history.replaceState(null, null, '#usr=' + LAST_USER);
+  }
+  HTML.query('#user-id').value = LAST_USER;
+
+  var L10N = { };
+  L10N.proto_id = {
+    'proto.user': 'Another Player',
+    'proto.toad.green': 'The Green Toad',
+    'proto.item.admin-hat': 'The Admin Hat',
+    'proto.spawn-wand.toad.green': 'The Admin Lair Spawn Wand: A Green Toad',
+    'world': 'The Neighbourhood'
+  };
+
+  L10N.icon = function(go) {
+    var url = undefined;
+    if (go.hash.proto_id === 'proto.user') {
+      url = (go.id === LAST_USER) ? 'player-me.png' : 'player-another.png';
+    } else if (go.hash.proto_id === 'proto.toad.green') {
+      url = 'toad.png';
+    }
+    return url;
+  }
+
+  // TODO: This should be proto_id-dependent
+  L10N.actions = {
+    'act.doff.common': 'Doff',
+    'act.don.common': 'Don',
+    'act.mob.collect.common': 'Catch it!',
+
+    // TODO: Reflect that '(Admin)' in the action id values,
+    //       use separate ids from common actions
+    'act.spawn.mob.common': 'Spawn (Admin)',
+    'act.remove.common': 'Disintegrate (Admin)'
+  };
+
+  L10N.chrs = {
+    'respawn_dt': 'respawn time (seconds)',
+    'reach': 'reach (meters)',
+    'vision': 'vision (meters)'
+  };
+
+  var MAP;
+  var MARKERS = { };
+  var NEXT_MARKERS = { };
+  var putMarker = function(id, pos, generator) {
+    var marker = MARKERS[id];
+    delete MARKERS[id];
+
+    if (!marker) {
+      marker = generator(pos, id);
+    } else if (pos) {
+      // If not pos, then we assume that position is somehow bound otherwise
+      marker.setPosition(pos);
+    }
+
+    assert(!NEXT_MARKERS[id]);
+    NEXT_MARKERS[id] = marker;
+
+    return marker;
+  };
+
+  var POSITION;
+
+  // TODO: Hack! Import the module properly!
+  var lonAvg = module.exports(10 * 1000); // TODO: Use Kalman filtering and make sure it actually configured so it works
+  var latAvg = module.exports(10 * 1000);
+
+  var SMOOTH = !!HTML.query('#smooth').checked;
+  var SIMULATION = !!HTML.query('#simulation').checked
+  var SIMULATED;
+
+  var getPosition = function() {
+    if (SIMULATION) {
+      SIMULATED = SIMULATED || POSITION;
+      return SIMULATED;
+    }
+    return {
+      lon: SMOOTH ? lonAvg.movingAverage() : POSITION.coords.longitude,
+      lat: SMOOTH ? latAvg.movingAverage() : POSITION.coords.latitude
+    };
+  };
+
+  // TODO: Yuck. Refactor this out.
+  var urlSuffix = function() {
+    var pos = getPosition();
+    return '?usr=' + encodeURIComponent(LAST_USER)
+      + '&lon=' + encodeURIComponent(pos.lon)
+      + '&lat=' + encodeURIComponent(pos.lat)
+      // TODO: Accuracy should be affected by smoothing too.
+      + '&acc=' + encodeURIComponent(POSITION.coords.accuracy);
+  };
+
+  var REFRESHER;
+  var REFRESH_TIMEOUT = 10 * 1000;
+
+  var SERVER = 'api/v1';
+
+  var assert = function(v, msg) {
+    if (v) {
+      return v;
+    }
+    throw new Error(msg || 'assertion failed');
+  };
+
+  // TODO: Add assetions on all go fields and sub-fields
+  var renderGameObject = function(go, root, map) {
+    var div = root.add('div.game-object');
+    div.dataset.go_id = assert(go.id, 'missing id for go #' + i);
+    div.dataset.proto_id = go.hash.proto_id;
+
+    var name = L10N.proto_id[go.id] ||
+      L10N.proto_id[go.hash.proto_id || go.id] ||
+      go.hash.proto_id;
+
+    if (go.hash.proto_id === 'proto.user') {
+      // TODO: Do uppercase via CSS instead, here and below.
+      name = go.id.toUpperCase()
+        + ((go.id === LAST_USER) ? ' (You)' : ' (Another Player)');
+    } else if (go.hash.proto_id === 'proto.user.hq.common') {
+      var owner_id = go.hash.owner_id;
+      name = owner_id.toUpperCase() + ' HQ '
+        + ((owner_id === LAST_USER) ? '(Yours)' : ' (Another Player\'s)')
+    } else if (go.hash.proto_id === 'proto.toad.green') {
+      name = new Chance(go.id).name() + ' (a Green Toad)';
+    }
+
+    var nameDiv = div.add('div.name');
+    var icon = L10N.icon(go);
+    if (icon) {
+      var img = nameDiv.add('img');
+      img.src = icon;
+      img.width = 32;
+      img.height = 32;
+    }
+    nameDiv.add('span').textContent = name;
+
+    if (go.geo) {
+      div.add('div.geo').textContent =
+        parseFloat(go.distance).toFixed(3) + 'm ('
+        + parseFloat(go.geo.lon).toFixed(5) + 'º, '
+        + parseFloat(go.geo.lat).toFixed(5) + 'º'
+        + ')';
+
+      if (map) {
+        var url = L10N.icon(go);
+
+        var marker = putMarker(
+          go.id, new google.maps.LatLng(go.geo.lat, go.geo.lon), function(pos) {
+            var result = new google.maps.Marker({
+              position: pos,
+              title: name,
+              map: map,
+              icon: url
+            });
+            result.addListener('click', function() {
+              HTML.query('div.game-object[data-go_id="' + go.id + '"]').scrollIntoView();
+            });
+            return result;
+          }
+        );
+
+        if (go.id === LAST_USER) {
+          MAP.panTo(new google.maps.LatLng(go.geo.lat, go.geo.lon));
+
+          putMarker(go.id + ":accuracy", undefined, function() {
+            var circle = new google.maps.Circle({
+              map: map,
+              radius: POSITION.coords.accuracy,
+              fillColor: '#DDDDDD',
+              strokeColor: '#AAAAFF',
+              strokeWeight: 1,
+              clickable: false
+            });
+            circle.bindTo('center', marker, 'position');
+            return circle;
+          });
+
+          putMarker(go.id + ":reach", undefined, function() {
+            var circle = new google.maps.Circle({
+              map: map,
+              radius: go.chrs.reach,
+              fillColor: '#DDDDDD',
+              clickable: false
+            });
+            circle.bindTo('center', marker, 'position');
+            return circle;
+          });
+
+          putMarker(go.id + ":vision", undefined, function() {
+            var circle = new google.maps.Circle({
+              map: map,
+              radius: go.chrs.vision,
+              fillColor: '#DDDDDD',
+              clickable: false
+            });
+            circle.bindTo('center', marker, 'position');
+            return circle;
+          });
+        }
+      }
+    }
+    div.add('div.id').textContent = go.id;
+
+    var chrs = div.add('div.chrs');
+    for (name in go.chrs) {
+      var entry = chrs.add('div.chr');
+      entry.add('span.name').textContent = L10N.chrs[name] || name;
+      entry.add('span.value').textContent = go.chrs[name];
+    }
+
+    var acts = div.add('div.acts');
+    for (var j = 0; j < go.acts.length; ++j) {
+      var action = go.acts[j];
+      var actionNode = acts.add('button.action');
+      actionNode.dataset.action_url = SERVER + assert(action.url) + urlSuffix();
+      actionNode.textContent = L10N.actions[action.id] || action.id;
+    }
+
+    var attached = div.add('div.attached');
+    for (var k = 0; k < go.attached.length; ++k) {
+      renderGameObject(go.attached[k], attached, null);
+    }
+
+    var stored = div.add('div.stored');
+    for (var i = 0; i < go.stored.length; ++i) {
+      renderGameObject(go.stored[i], stored, null);
+    }
+  };
+
+  var render = function(data, root) {
+    if (data.status === 'ERROR') {
+      // TODO: Catch this somewhere
+      throw new Error(data.message || 'unknown server error');
+    }
+
+    root.innerHTML = ''; // Clear contents
+
+    // TODO: Handlebars?
+    assert(
+      data.gos.sort(function(lhs, rhs) {
+        return (lhs.distance || 0) - (rhs.distance || 0)
+      }),
+      "server didn't send any game objects"
+    ).forEach(function(go) {
+      renderGameObject(go, root, MAP)
+    });
+
+    Object.keys(MARKERS).forEach(function(id) {
+      MARKERS[id].setMap(null);
+    });
+    MARKERS = NEXT_MARKERS;
+    NEXT_MARKERS = { };
+  };
+
+  var rootNode = HTML.query('#output');
+
+// TODO: Allow only one refresh invocation at a time,
+  //       display a progress bar while it is in progress.
+  var refresh = function() {
+    if (REFRESHER !== undefined) {
+      clearTimeout(REFRESHER);
+    }
+    REFRESHER = setTimeout(refresh, REFRESH_TIMEOUT);
+
+    var xhr = new XMLHttpRequest();
+    xhr.open(
+      'GET',
+      SERVER + '/' + urlSuffix(),
+      true
+    );
+    // TODO: Handle errors properly
+    xhr.onload = function(e) {
+      render(JSON.parse(this.response), rootNode);
+    };
+    xhr.send();
+  };
+
+  var refreshAndMaybeRegister = function() {
+    var xhr = new XMLHttpRequest();
+    xhr.open(
+      'POST',
+      SERVER + '/go/' + encodeURIComponent(LAST_USER) + urlSuffix()
+    );
+    xhr.onloadend = function(e) {
+      if (this.status === 200 || this.status === 409) {
+        refresh();
+      } else if (this.status === 401 || this.status === 404) {
+        // Create a new user
+        var xhr2 = new XMLHttpRequest();
+        xhr2.open(
+          'POST',
+          SERVER + '/register' + urlSuffix()
+        );
+        // TODO: Handle errors properly
+        xhr2.onload = function(e) {
+          var response = JSON.parse(this.response);
+          if (response.status === 'ERROR') {
+            // TODO: Catch this somewhere
+            throw new Error(response.message || 'unknown server error');
+          }
+          refresh();
+        };
+        xhr2.send();
+      } else {
+        // TODO: Catch this error somewhere.
+        throw new Error('failed to check user existence');
+      }
+    };
+    xhr.send();
+  }
+
+  if (!('geolocation' in navigator)) {
+    // TODO: Show 'use these browsers instead' page.
+    // TODO: Catch this error somewhere.
+    throw new Error('geolocation is not supported by your browser');
+  }
+
+  var handlersInstalled = false;
+
+  // NB: We would not want to unsubscribe, so we're ignoring the returned id.
+  navigator.geolocation.watchPosition(function(pos) {
+    lonAvg.push(pos.timestamp, pos.coords.longitude);
+    latAvg.push(pos.timestamp, pos.coords.latitude);
+
+    // TODO: Generalize position formatting
+    HTML.query('#location').textContent = '('
+      + parseFloat(lonAvg.movingAverage()).toFixed(5) + 'º,'
+      + parseFloat(latAvg.movingAverage()).toFixed(5) + 'º;'
+      + parseFloat(pos.coords.longitude).toFixed(5) + 'º, '
+      + parseFloat(pos.coords.latitude).toFixed(5) + 'º; '
+      + parseFloat(pos.coords.accuracy).toFixed(2) + 'm, '
+      + (pos.coords.heading !== null ? pos.coords.heading : '?') + 'º '
+      + (pos.coords.speed !== null ? pos.coords.speed : '?') + 'm/s '
+      + ')';
+    console.log('POS', pos);
+    POSITION = pos;
+
+    if (!handlersInstalled) {
+      handlersInstalled = true;
+
+      // Adding event listeners only after we have the initial position data
+      // to prevent errors.
+      rootNode.addEventListener('click', function(e) {
+        if (e.target.dataset.action_url) {
+          var xhr = new XMLHttpRequest();
+          xhr.open('POST', e.target.dataset.action_url);
+          // TODO: Handle errors properly
+          xhr.onload = function(e) {
+            var response = JSON.parse(this.response);
+            if (response.status === 'ERROR') {
+              // TODO: Catch this somewhere
+              throw new Error(response.message || 'unknown server error');
+            }
+            refresh();
+          };
+          xhr.send();
+        }
+        return false;
+      });
+
+      // TODO: Display a loading indicator somewhere.
+      HTML.query('#refresh').addEventListener('click', function(e) {
+        if (REFRESHER !== undefined) {
+          // Temporarily stop refreshes
+          clearTimeout(REFRESHER);
+          REFRESHER = undefined;
+        }
+        var user_id = HTML.query('#user-id').value;
+        if (user_id !== LAST_USER) {
+          LAST_USER = user_id;
+          history.pushState(null, null, '#usr=' + encodeURIComponent(LAST_USER));
+
+          refreshAndMaybeRegister();
+        } else {
+          refresh();
+        }
+      });
+
+      HTML.query('#smooth').addEventListener('change', function(e) {
+        SMOOTH = e.target.checked;
+      });
+
+      var simEvId;
+      HTML.query('#simulation').addEventListener('change', function(e) {
+        SIMULATION = e.target.checked;
+        SIMULATED = POSITION;
+        if (SIMULATION) {
+          simEvId = google.maps.event.addListener(MAP, "click", function(e) {
+            SIMULATED = { lon: e.latLng.lng(), lat: e.latLng.lat() };
+            refresh();
+          });
+        } else {
+          if (simEvId) {
+            google.maps.event.removeListener(simEvId);
+          }
+          refresh();
+        }
+      });
+
+      window.addEventListener('hashchange', function() {
+        // TODO: Yuck! Geneneralize this!
+        var user_id = (window.location.hash ? window.location.hash.slice(5) : null) || LAST_USER;
+        if (user_id !== window.location.hash.slice(5)) {
+          history.replaceState(null, null, '#usr=' + user_id);
+        }
+
+        if (user_id !== LAST_USER) {
+          LAST_USER = user_id;
+          HTML.query('#user-id').value = LAST_USER;
+          refreshAndMaybeRegister();
+        }
+      });
+
+      window.addEventListener('popstate', function() {
+        var user_id = (window.location.hash ? window.location.hash.slice(5) : null) || LAST_USER;
+        if (user_id !== window.location.hash.slice(5)) {
+          history.replaceState(null, null, '#usr=' + user_id);
+        }
+
+        if (user_id !== LAST_USER) {
+          LAST_USER = user_id;
+          HTML.query('#user-id').value = LAST_USER;
+          refreshAndMaybeRegister();
+        }
+      });
+
+      var pos = getPosition();
+      MAP = new google.maps.Map(assert(document.getElementById('map')), {
+        center: new google.maps.LatLng(pos.lat, pos.lon),
+        zoom: 18,
+        mapTypeId: google.maps.MapTypeId.ROADMAP,
+        disableDefaultUI: true,
+        disableDoubleClickZoom: true,
+        draggable: false,
+        scrollwheel: false,
+        styles: [ {
+          featureType: "poi",
+          stylers: [
+            { visibility: "off" }
+          ]
+        } ]
+      });
+
+      refreshAndMaybeRegister();
+    } else {
+      refresh();
+    }
+  }, function(err) {
+    // TODO: Catch this somewhere
+    throw err;
+  }, {
+    enableHighAccuracy: true,
+    timeout: 10 * 1000,
+    maximumAge: 0
+  });
+
+};
+
+function init() {
+  google.maps.event.addDomListener(window, "load", main);
+}
+  </script>
+
+  <script async defer
+    src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBGwjBu6vKokc84zekMPN-26o3eL1DXpZQ&callback=init"
+  ></script>
+
+  <div><small>Icons are based on works by <a href="http://game-icons.net">game-icons.net</a></small></div>
+
+  <script>
+    (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+    (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+    m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+    })(window,document,'script','https://www.google-analytics.com/analytics.js','ga');
+
+    ga('create', 'UA-86962013-1', 'auto');
+    ga('send', 'pageview');
+
+  </script>
+</body>
+</html>

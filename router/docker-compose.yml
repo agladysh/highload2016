@@ -1,0 +1,9 @@
+version: "2"
+services:
+  router:
+    build: .
+    volumes:
+      - ./nginx/.htpasswd:/usr/local/openresty/nginx/.htpasswd:ro
+      - ./nginx/static:/usr/local/openresty/nginx/static:ro
+    ports:
+      - "8080:8080"

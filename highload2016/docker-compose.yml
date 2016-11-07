@@ -1,0 +1,15 @@
+version: "2"
+services:
+  openresty:
+    extends:
+      file: ../common/docker-compose.yml
+      service: openresty
+    volumes:
+      - ./nginx/lualib:/usr/local/openresty/nginx/lualib:ro
+      - ./nginx/api:/usr/local/openresty/nginx/api:ro
+  redis:
+    extends:
+      file: ../common/docker-compose.yml
+      service: redis
+    volumes:
+      - ./redis:/data
